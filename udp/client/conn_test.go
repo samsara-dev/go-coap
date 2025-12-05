@@ -17,6 +17,7 @@ import (
 	coapNet "github.com/plgd-dev/go-coap/v3/net"
 	"github.com/plgd-dev/go-coap/v3/net/responsewriter"
 	"github.com/plgd-dev/go-coap/v3/options"
+	"github.com/plgd-dev/go-coap/v3/pkg/runner/periodic"
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/stretchr/testify/assert"
@@ -111,6 +112,15 @@ func TestConnDeduplication(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, message.AppOctets, ct)
 	require.Equal(t, []byte{1}, bodyToBytes(t, got.Body()))
+
+	// Verify connection statistics
+	// Both requests are sent, but the second uses cached response
+	stats := cc.Stats()
+	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesRetransmitted)
+	assert.Equal(t, uint64(0), stats.TotalRetransmits)
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
 
 func TestConnDeduplicationRetransmission(t *testing.T) {
@@ -155,11 +165,17 @@ func TestConnDeduplicationRetransmission(t *testing.T) {
 		assert.NoError(t, errS)
 	}()
 
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+	defer cancel()
+
 	cc, err := udp.Dial(l.LocalAddr().String(),
 		options.WithErrors(func(err error) {
 			require.NoError(t, err)
 		}),
 		options.WithTransmission(1, 100*time.Millisecond, 50),
+		// Periodically check for expiration more quickly than normal to avoid
+		// long-running tests.
+		options.WithPeriodicRunner(periodic.New(ctx.Done(), time.Millisecond*10)),
 	)
 	require.NoError(t, err)
 	defer func() {
@@ -170,9 +186,6 @@ func TestConnDeduplicationRetransmission(t *testing.T) {
 	// Setup done - Run Tests
 
 	// Process several datagrams that reflect retries and block transfer with duplicate messages
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
-	defer cancel()
-
 	var got *pool.Message
 
 	// First request should get "1" as result
@@ -194,6 +207,19 @@ func TestConnDeduplicationRetransmission(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, message.AppOctets, ct)
 	require.Equal(t, []byte{2}, bodyToBytes(t, got.Body()))
+
+	// Wait a bit to ensure periodic runner has processed retransmissions
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify connection statistics after both requests
+	// The first request had a 200ms delay with 100ms acknowledgeTimeout, so it should have retransmitted
+	stats := cc.Stats()
+	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
+	// Depending on test timing, we might see multiple retransmissions.
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(2))
+	assert.Equal(t, uint64(1), stats.MessagesRetransmitted)
+	assert.GreaterOrEqual(t, stats.TotalRetransmits, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
 
 func testParallelConnGet(t *testing.T, numParallel int) {
@@ -306,6 +332,13 @@ func testParallelConnGet(t *testing.T, numParallel int) {
 				}()
 			}
 			wg.Wait()
+
+			// Verify connection statistics
+			// Each parallel request should result in 1 transmitted and 1 received message
+			stats := cc.Stats()
+			assert.GreaterOrEqual(t, stats.MessagesTransmitted, uint64(numParallel))
+			assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(numParallel))
+			assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 		})
 	}
 }
@@ -391,6 +424,15 @@ func TestConnGetSeparateMessage(t *testing.T) {
 	resp, err := cc.Do(req)
 	require.NoError(t, err)
 	assert.Equal(t, codes.Content, resp.Code())
+
+	// Wait a bit to ensure the server processes the message.
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify connection statistics
+	stats := cc.Stats()
+	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
 
 func testConnPost(t *testing.T, numParallel int) {
@@ -524,6 +566,13 @@ func testConnPost(t *testing.T, numParallel int) {
 				}()
 			}
 			wgNumParallel.Wait()
+
+			// Verify connection statistics
+			// Each parallel request should result in 1 transmitted and 1 received message
+			stats := cc.Stats()
+			assert.GreaterOrEqual(t, stats.MessagesTransmitted, uint64(numParallel))
+			assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(numParallel))
+			assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 		})
 	}
 }
@@ -666,6 +715,13 @@ func testConnPut(t *testing.T, numParallel int) {
 				}()
 			}
 			wgNumParallel.Wait()
+
+			// Verify connection statistics
+			// Each parallel request should result in 1 transmitted and 1 received message
+			stats := cc.Stats()
+			assert.GreaterOrEqual(t, stats.MessagesTransmitted, uint64(numParallel))
+			assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(numParallel))
+			assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 		})
 	}
 }
@@ -788,6 +844,13 @@ func testConnDelete(t *testing.T, numParallel int) {
 				}()
 			}
 			wgNumParallel.Wait()
+
+			// Verify connection statistics
+			// Each parallel request should result in 1 transmitted and 1 received message
+			stats := cc.Stats()
+			assert.GreaterOrEqual(t, stats.MessagesTransmitted, uint64(numParallel))
+			assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(numParallel))
+			assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 		})
 	}
 }
@@ -831,6 +894,16 @@ func TestConnPing(t *testing.T) {
 	defer cancel()
 	err = cc.Ping(ctx)
 	require.NoError(t, err)
+
+	// Wait a bit to ensure the server processes the message.
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify connection statistics
+	// Ping sends a CON message and receives an ACK/RST
+	stats := cc.Stats()
+	assert.Equal(t, uint64(1), stats.MessagesTransmitted)
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
 
 func TestConnRequestMonitorCloseConnection(t *testing.T) {
@@ -925,6 +998,13 @@ func TestConnRequestMonitorCloseConnection(t *testing.T) {
 	case <-ctx.Done():
 		require.Fail(t, "request monitor not called")
 	}
+
+	// Verify connection statistics
+	// GET request succeeds, DELETE request triggers error but is still transmitted
+	stats := cc.Stats()
+	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
 
 func TestConnRequestMonitorDropRequest(t *testing.T) {
@@ -1003,4 +1083,11 @@ func TestConnRequestMonitorDropRequest(t *testing.T) {
 	_, err = cc.Do(deleteReq)
 	require.Error(t, err)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Verify connection statistics
+	// GET request succeeds, DELETE request is dropped by monitor but still transmitted
+	stats := cc.Stats()
+	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
