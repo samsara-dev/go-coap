@@ -736,7 +736,30 @@ func sendJustAcknowledgeMessage(reqType message.Type, w *responsewriter.Response
 	return reqType == message.Confirmable && !w.Message().IsModified()
 }
 
+// isBlockwiseContinuationRequest checks if the message is a blockwise continuation request
+// (has Block1/Block2 option and is a request code, not a response code)
+func isBlockwiseContinuationRequest(msg *pool.Message) bool {
+	hasBlock1 := msg.HasOption(message.Block1)
+	hasBlock2 := msg.HasOption(message.Block2)
+	if !hasBlock1 && !hasBlock2 {
+		return false
+	}
+	// Blockwise continuation requests have request codes (GET, POST, PUT, DELETE)
+	// Response codes (like Continue, Content, etc.) are not continuation requests
+	code := msg.Code()
+	return code >= codes.GET && code <= codes.DELETE
+}
+
 func (cc *Conn) processResponse(reqType message.Type, reqMessageID int32, w *responsewriter.ResponseWriter[*Conn]) error {
+	// Blockwise continuation requests should remain Confirmable and be sent as new requests
+	// Don't modify their type as if they were responses
+	if isBlockwiseContinuationRequest(w.Message()) {
+		// Ensure it's Confirmable for retransmission
+		w.Message().SetType(message.Confirmable)
+		w.Message().SetMessageID(cc.GetMessageID())
+		return nil
+	}
+
 	switch {
 	case isPongOrResetResponse(w):
 		if reqType == message.Confirmable {
@@ -840,6 +863,15 @@ func (cc *Conn) ProcessReceivedMessageWithHandler(req *pool.Message, handler con
 		return
 	}
 	upsertInterfaceToMessage(w.Message(), ifIndex)
+	// Blockwise continuation requests need retransmission, so use writeMessage instead of writeMessageAsync
+	if isBlockwiseContinuationRequest(w.Message()) {
+		errW := cc.writeMessage(w.Message())
+		if errW != nil {
+			cc.closeConnection()
+			cc.errors(fmt.Errorf(errFmtWriteResponse, errW))
+		}
+		return
+	}
 	errW := cc.writeMessageAsync(w.Message())
 	if errW != nil {
 		cc.closeConnection()
