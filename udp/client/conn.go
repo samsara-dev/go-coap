@@ -194,6 +194,7 @@ type Conn struct {
 	blockWise          *blockwise.BlockWise[*Conn]
 	observationHandler *observation.Handler[*Conn]
 	transmission       *Transmission
+	connectionStats    *ConnectionStats
 	messagePool        *pool.Pool
 
 	processReceivedMessage config.ProcessReceivedMessageFunc[*Conn]
@@ -224,6 +225,37 @@ type Transmission struct {
 	maxRetransmit      *atomic.Uint32
 }
 
+// ConnectionStats tracks connection statistics including message transmission, reception, and retransmission.
+type ConnectionStats struct {
+	// MessagesTransmitted is the total number of messages transmitted (excluding retransmissions).
+	MessagesTransmitted *atomic.Uint64
+	// MessagesReceived is the total number of messages received.
+	MessagesReceived *atomic.Uint64
+	// TotalRetransmissions is the total number of message retransmissions performed.
+	TotalRetransmissions *atomic.Uint64
+	// MessagesRetransmitted is the number of unique messages that required at least one retransmission.
+	MessagesRetransmitted *atomic.Uint64
+	// MessagesExceededMaxRetransmit is the number of messages that exceeded the maximum retransmit limit.
+	MessagesExceededMaxRetransmit *atomic.Uint64
+}
+
+// NewConnectionStats creates a new ConnectionStats instance with all counters initialized to zero.
+func NewConnectionStats() *ConnectionStats {
+	return &ConnectionStats{
+		MessagesTransmitted:          atomic.NewUint64(0),
+		MessagesReceived:              atomic.NewUint64(0),
+		TotalRetransmissions:          atomic.NewUint64(0),
+		MessagesRetransmitted:         atomic.NewUint64(0),
+		MessagesExceededMaxRetransmit: atomic.NewUint64(0),
+	}
+}
+
+// String returns a string representation of the connection statistics.
+func (c *ConnectionStats) String() string {
+	return fmt.Sprintf("ConnectionStats{MessagesTransmitted: %d, MessagesReceived: %d, TotalRetransmissions: %d, MessagesRetransmitted: %d, MessagesExceededMaxRetransmit: %d}",
+		c.MessagesTransmitted.Load(), c.MessagesReceived.Load(), c.TotalRetransmissions.Load(), c.MessagesRetransmitted.Load(), c.MessagesExceededMaxRetransmit.Load())
+}
+
 // SetTransmissionNStart changing the nStart value will only effect requests queued after the change. The requests waiting here already before the change will get unblocked when enough weight has been released.
 func (t *Transmission) SetTransmissionNStart(d uint32) {
 	t.nStart.Store(d)
@@ -239,6 +271,11 @@ func (t *Transmission) SetTransmissionMaxRetransmit(d uint32) {
 
 func (cc *Conn) Transmission() *Transmission {
 	return cc.transmission
+}
+
+// ConnectionStats returns the connection statistics for this connection.
+func (cc *Conn) ConnectionStats() *ConnectionStats {
+	return cc.connectionStats
 }
 
 type ConnOptions struct {
@@ -330,6 +367,7 @@ func NewConnWithOpts(session Session, cfg *Config, opts ...Option) *Conn {
 			atomic.NewDuration(cfg.TransmissionAcknowledgeTimeout),
 			atomic.NewUint32(cfg.TransmissionMaxRetransmit),
 		},
+		connectionStats: NewConnectionStats(),
 		blockwiseSZX: cfg.BlockwiseSZX,
 
 		tokenHandlerContainer:     coapSync.NewMap[uint64, HandlerFunc](),
@@ -544,6 +582,7 @@ func (cc *Conn) writeMessageAsync(req *pool.Message) error {
 	if err := cc.session.WriteMessage(req); err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.connectionStats.MessagesTransmitted.Inc()
 	return nil
 }
 
@@ -564,6 +603,7 @@ func (cc *Conn) writeMessage(req *pool.Message) error {
 	if err := cc.session.WriteMessage(req); err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.connectionStats.MessagesTransmitted.Inc()
 	if err := cc.waitForAcknowledge(req, respChan); err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
@@ -621,6 +661,7 @@ func (cc *Conn) AsyncPing(receivedPong func()) (func(), error) {
 		removeMidHandler()
 		return nil, fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.connectionStats.MessagesTransmitted.Inc()
 	return removeMidHandler, nil
 }
 
@@ -818,9 +859,12 @@ func (cc *Conn) handleReq(w *responsewriter.ResponseWriter[*Conn], req *pool.Mes
 		cc.errors(fmt.Errorf(errFmtWriteResponse, err))
 		return
 	} else if ok {
+		// Duplicate message found in cache, don't count it
 		return
 	}
 
+	// Count message as received only after confirming it's not a duplicate
+	cc.connectionStats.MessagesReceived.Inc()
 	w.Message().SetModified(false)
 	reqType := req.Type()
 	reqMessageID := req.MessageID()
@@ -945,9 +989,14 @@ func (cc *Conn) Process(cm *coapNet.ControlMessage, datagram []byte) error {
 		return nil
 	}
 	cc.inactivityMonitor.Notify()
-	if cc.handleSpecialMessages(req) {
+	// handleSpecialMessages handles pings and responses to outstanding requests
+	// If it handles the message, count it and return
+	if handled := cc.handleSpecialMessages(req); handled {
+		cc.connectionStats.MessagesReceived.Inc()
 		return nil
 	}
+	// For other messages, deduplication happens in handleReq via checkResponseCache
+	// We'll count it there after confirming it's not a duplicate
 	select {
 	case cc.receivedMessageReader.C() <- req:
 	case <-cc.Context().Done():
@@ -969,12 +1018,20 @@ func (cc *Conn) checkMidHandlerContainer(now time.Time, maxRetransmit uint32, ac
 	if value.IsExpired(now, maxRetransmit) {
 		cc.midHandlerContainer.Delete(key)
 		value.ReleaseMessage(cc)
+		// Track message that exceeded max retransmit
+		cc.connectionStats.MessagesExceededMaxRetransmit.Inc()
 		cc.errors(fmt.Errorf(errFmtWriteRequest, context.DeadlineExceeded))
 		return
 	}
 	if !value.Retransmit(now, acknowledgeTimeout) {
 		return
 	}
+	// Track retransmission - check if this is the first retransmission for this message
+	if value.retransmit.Load() == 1 {
+		// First time we're counting this message as retransmitted
+		cc.connectionStats.MessagesRetransmitted.Inc()
+	}
+	cc.connectionStats.TotalRetransmissions.Inc()
 	msg, ok, err := value.GetMessage(cc)
 	if err != nil {
 		cc.midHandlerContainer.Delete(key)
@@ -1038,6 +1095,7 @@ func (cc *Conn) WriteMulticastMessage(req *pool.Message, address *net.UDPAddr, o
 	if err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.connectionStats.MessagesTransmitted.Inc()
 	return nil
 }
 
