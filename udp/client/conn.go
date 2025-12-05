@@ -104,14 +104,15 @@ func (m *midElement) IsExpired(now time.Time, maxRetransmit uint32) bool {
 	return retransmit >= maxRetransmit
 }
 
-func (m *midElement) Retransmit(now time.Time, acknowledgeTimeout time.Duration) bool {
+func (m *midElement) Retransmit(now time.Time, acknowledgeTimeout time.Duration) (shouldRetransmit bool, isFirstRetransmit bool) {
 	if now.After(m.start.Add(acknowledgeTimeout * time.Duration(m.retransmit.Load()+1))) {
-		m.retransmit.Inc()
+		newValue := m.retransmit.Add(1)
+		isFirstRetransmit = (newValue == 1)
 		// retransmit
-		return true
+		return true, isFirstRetransmit
 	}
 	// wait for next retransmit
-	return false
+	return false, false
 }
 
 func (m *midElement) GetMessage(cc *Conn) (*pool.Message, bool, error) {
@@ -196,6 +197,12 @@ type Conn struct {
 	transmission       *Transmission
 	messagePool        *pool.Pool
 
+	messagesTransmitted           atomic.Uint64
+	messagesReceived              atomic.Uint64
+	messagesRetransmitted         atomic.Uint64
+	totalRetransmits              atomic.Uint64
+	messagesExceededMaxRetransmit atomic.Uint64
+
 	processReceivedMessage config.ProcessReceivedMessageFunc[*Conn]
 	errors                 ErrorFunc
 	responseMsgCache       MessageCache
@@ -239,6 +246,41 @@ func (t *Transmission) SetTransmissionMaxRetransmit(d uint32) {
 
 func (cc *Conn) Transmission() *Transmission {
 	return cc.transmission
+}
+
+// ConnectionStats tracks connection statistics including message
+// transmission, reception, and retransmission.
+type ConnectionStats struct {
+	// MessagesTransmitted is the total number of messages transmitted
+	// (excluding retransmissions).
+	MessagesTransmitted uint64
+	// MessagesReceived is the total number of messages received.
+	MessagesReceived uint64
+	// MessagesRetransmitted is the number of unique messages that required at
+	// least one retransmission.
+	MessagesRetransmitted uint64
+	// TotalRetransmits is the total number of retransmissions performed for
+	// all messages.
+	TotalRetransmits uint64
+	// MessagesExceededMaxRetransmit is the number of messages that exceeded
+	// the maximum retransmit limit.
+	MessagesExceededMaxRetransmit uint64
+}
+
+func (c ConnectionStats) String() string {
+	return fmt.Sprintf("ConnectionStats{MessagesTransmitted: %d, MessagesReceived: %d, MessagesRetransmitted: %d, TotalRetransmits: %d, MessagesExceededMaxRetransmit: %d}",
+		c.MessagesTransmitted, c.MessagesReceived, c.MessagesRetransmitted, c.TotalRetransmits, c.MessagesExceededMaxRetransmit)
+}
+
+// Stats returns the current statistics for this connection.
+func (cc *Conn) Stats() ConnectionStats {
+	return ConnectionStats{
+		MessagesTransmitted:           cc.messagesTransmitted.Load(),
+		MessagesReceived:              cc.messagesReceived.Load(),
+		MessagesRetransmitted:         cc.messagesRetransmitted.Load(),
+		TotalRetransmits:              cc.totalRetransmits.Load(),
+		MessagesExceededMaxRetransmit: cc.messagesExceededMaxRetransmit.Load(),
+	}
 }
 
 type ConnOptions struct {
@@ -544,6 +586,7 @@ func (cc *Conn) writeMessageAsync(req *pool.Message) error {
 	if err := cc.session.WriteMessage(req); err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.messagesTransmitted.Inc()
 	return nil
 }
 
@@ -564,6 +607,7 @@ func (cc *Conn) writeMessage(req *pool.Message) error {
 	if err := cc.session.WriteMessage(req); err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.messagesTransmitted.Inc()
 	if err := cc.waitForAcknowledge(req, respChan); err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
@@ -621,6 +665,7 @@ func (cc *Conn) AsyncPing(receivedPong func()) (func(), error) {
 		removeMidHandler()
 		return nil, fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.messagesTransmitted.Inc()
 	return removeMidHandler, nil
 }
 
@@ -798,6 +843,8 @@ func (cc *Conn) handleReq(w *responsewriter.ResponseWriter[*Conn], req *pool.Mes
 		return
 	}
 
+	// Count message as received only after confirming it's not a duplicate
+	cc.messagesReceived.Inc()
 	w.Message().SetModified(false)
 	reqType := req.Type()
 	reqMessageID := req.MessageID()
@@ -914,8 +961,13 @@ func (cc *Conn) Process(cm *coapNet.ControlMessage, datagram []byte) error {
 	}
 	cc.inactivityMonitor.Notify()
 	if cc.handleSpecialMessages(req) {
+		cc.messagesReceived.Inc()
 		return nil
 	}
+
+	// For messages not handled by handleSpecialMessages (pings and
+	// responses), deduplication happens in handleReq via checkResponseCache
+	// We'll count it there after confirming it's not a duplicate.
 	select {
 	case cc.receivedMessageReader.C() <- req:
 	case <-cc.Context().Done():
@@ -937,12 +989,25 @@ func (cc *Conn) checkMidHandlerContainer(now time.Time, maxRetransmit uint32, ac
 	if value.IsExpired(now, maxRetransmit) {
 		cc.midHandlerContainer.Delete(key)
 		value.ReleaseMessage(cc)
+		// Track messages that exceeded max retransmit
+		cc.messagesExceededMaxRetransmit.Inc()
 		cc.errors(fmt.Errorf(errFmtWriteRequest, context.DeadlineExceeded))
 		return
 	}
-	if !value.Retransmit(now, acknowledgeTimeout) {
+	shouldRetransmit, isFirstRetransmit := value.Retransmit(now, acknowledgeTimeout)
+	if !shouldRetransmit {
 		return
 	}
+
+	// Track distinct message retransmits and total retransmits.
+	// Unlike the standard message transmit stats, we increment these
+	// regardless of whether writing the message errors, because writing the
+	// message counts as one retransmit against the max retransmit count.
+	if isFirstRetransmit {
+		cc.messagesRetransmitted.Inc()
+	}
+	cc.totalRetransmits.Inc()
+
 	msg, ok, err := value.GetMessage(cc)
 	if err != nil {
 		cc.midHandlerContainer.Delete(key)
@@ -1006,6 +1071,7 @@ func (cc *Conn) WriteMulticastMessage(req *pool.Message, address *net.UDPAddr, o
 	if err != nil {
 		return fmt.Errorf(errFmtWriteRequest, err)
 	}
+	cc.messagesTransmitted.Inc()
 	return nil
 }
 
