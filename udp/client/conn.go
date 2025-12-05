@@ -1020,7 +1020,7 @@ func (cc *Conn) checkMidHandlerContainer(now time.Time, maxRetransmit uint32, ac
 		value.ReleaseMessage(cc)
 		// Track message that exceeded max retransmit
 		cc.connectionStats.MessagesExceededMaxRetransmit.Inc()
-		cc.errors(fmt.Errorf(errFmtWriteRequest, context.DeadlineExceeded))
+		cc.errors(fmt.Errorf(errFmtWriteRequest, ErrRetransmitLimitReached)
 		return
 	}
 	if !value.Retransmit(now, acknowledgeTimeout) {
