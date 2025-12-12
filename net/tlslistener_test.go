@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -224,7 +226,10 @@ func TestTLSListenerCheckForInfinitLoop(t *testing.T) {
 			c := coapNet.NewConn(con)
 			_, err = c.ReadWithContext(context.Background(), b)
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "EOF")
+			// When connection is closed during handshake, error can be either EOF
+			// or connection reset. This happens because closing during an active
+			// operation causes the OS to send RST instead of FIN.
+			assert.True(t, errors.Is(err, io.EOF) || coapNet.IsConnectionBrokenError(err))
 			err = con.Close()
 			require.Error(t, err)
 		})
