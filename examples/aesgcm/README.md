@@ -186,6 +186,97 @@ Network Socket → Custom Transport → Decrypt → CoAP Stack → CoAP Message
 | **Library Integration** | No changes needed | No changes needed | May need changes |
 | **Recommended For** | Connectionless UDP, per-message schemes | Most use cases | Library extensions |
 
+---
+
+### 4. Payload-Only Encryption with Post-Serialization MAC
+
+**Description**: Encrypt only the CoAP payload before passing it to the library, then append a MAC to the serialized CoAP packet after the library serializes it but before transmission.
+
+**How it works**:
+- Encrypt the payload before setting it in the CoAP message
+- CoAP library serializes the message (header + encrypted payload)
+- Append MAC to the serialized bytes before transmission
+- On receive: Verify MAC, then unmarshal, then decrypt payload
+
+**Example flow**:
+```
+Plain Payload → Encrypt → CoAP Message (with encrypted payload)
+    ↓
+CoAP Library serializes → [Header][Encrypted Payload]
+    ↓
+Append MAC → [Header][Encrypted Payload][MAC] → UDP
+    ↓
+On receive: Verify MAC → Unmarshal → Decrypt Payload
+```
+
+**Pros**:
+- ✅ **De-duplication preserved**: CoAP headers (MessageID, Token) remain visible for de-duplication
+- ✅ **Selective encryption**: Only payload is encrypted, headers remain plain
+- ✅ **CoAP-aware**: Works with CoAP's message structure
+
+**Cons**:
+- ❌ **MAC placement complexity**: You need to know where the CoAP message ends to extract/verify the MAC. This requires either:
+  - Parsing the CoAP format to find message boundaries (complex, error-prone)
+  - Using fixed-size MAC and extracting last N bytes (works but breaks round-trip integrity)
+- ❌ **Round-trip integrity broken**: CoAP expects to serialize and unmarshal the exact same bytes. Appending MAC means the bytes you send ≠ bytes you receive (after MAC verification)
+- ❌ **Session-level interception required**: You must intercept at the session's `WriteMessage()` and `Run()` methods, similar to Approach #1, but with additional complexity
+- ❌ **Response cache issues**: The response cache stores message objects (not bytes), so this is actually fine, but you still need custom session logic
+- ❌ **Non-standard format**: You're creating a modified CoAP format that other implementations won't understand
+- ❌ **Two-stage processing overhead**: Serialize → Add MAC on send; Verify MAC → Unmarshal on receive adds complexity
+
+**De-duplication Analysis**:
+- ✅ **Will work**: CoAP de-duplicates based on MessageID (in the header), which remains unencrypted
+- ✅ **Response cache works**: The cache stores message objects, not serialized bytes, so it's unaffected
+- ⚠️ **But**: You still need custom session logic to handle MAC verification before unmarshaling
+
+**Is this a bad idea?**
+It's not necessarily "bad," but it's **more complex than necessary** and introduces several challenges:
+
+1. **MAC extraction**: The hardest part is knowing where the CoAP message ends. Options:
+   - **Fixed-size MAC**: Extract last N bytes (e.g., 16 bytes for AES-GCM tag). Works but requires custom unmarshaling logic.
+   - **Parse CoAP format**: Find the payload separator (0xFF) and calculate message length. Complex and error-prone.
+
+2. **Better alternatives**:
+   - **Use Approach #1 (Custom Session)**: Encrypt the entire serialized message, including headers. Simpler, and you can still do de-duplication by caching MessageIDs separately.
+   - **Use Approach #2 (Middleware)**: Encrypt everything transparently. De-duplication still works because it happens before encryption/decryption.
+   - **Hybrid**: Encrypt payload in session, but use authenticated encryption (AES-GCM) which includes the MAC in the ciphertext. No need to append MAC separately.
+
+**Recommended Implementation** (if you pursue this approach):
+```go
+// In Session.WriteMessage():
+1. Encrypt payload before setting in message
+2. Marshal message to get serialized bytes
+3. Calculate MAC over serialized bytes (or just headers + encrypted payload)
+4. Append MAC to serialized bytes
+5. Write to connection
+
+// In Session.Run():
+1. Read packet from connection
+2. Extract last N bytes as MAC
+3. Verify MAC on remaining bytes
+4. Unmarshal remaining bytes (without MAC)
+5. Decrypt payload
+6. Process message
+```
+
+**Best for**: Scenarios where you need payload-only encryption but want to preserve header visibility for routing/de-duplication. However, Approach #1 or #2 are usually simpler and more maintainable.
+
+---
+
+## Comparison Summary
+
+| Aspect | Custom Session | Middleware Pattern | Transport Layer | Payload-Only + MAC |
+|--------|---------------|-------------------|-----------------|-------------------|
+| **Complexity** | Medium | Low | High | High |
+| **Reusability** | Low | High | Medium | Low |
+| **Separation of Concerns** | Medium | High | High | Low |
+| **Per-Message Control** | High | Low | Low | Medium |
+| **Connectionless Support** | Easy | Requires management | Depends on implementation | Easy |
+| **Library Integration** | No changes needed | No changes needed | May need changes | No changes needed |
+| **De-duplication** | Works | Works | Works | Works (headers visible) |
+| **Header Visibility** | Encrypted | Encrypted | Encrypted | Plain |
+| **Recommended For** | Connectionless UDP, per-message schemes | Most use cases | Library extensions | Special cases requiring header visibility |
+
 ## Current Implementation
 
 This example uses the **Middleware Pattern** (Approach #2), which provides a good balance of simplicity, reusability, and transparency. The `AESGCMConn` type wraps a UDP connection, and the `Session` type uses it transparently through `coapNet.Conn`.
