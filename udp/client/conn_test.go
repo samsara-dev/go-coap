@@ -222,6 +222,178 @@ func TestConnDeduplicationRetransmission(t *testing.T) {
 	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
 }
 
+func TestConnExponentialBackoffRetransmission(t *testing.T) {
+	l, err := coapNet.NewListenUDP("udp", "")
+	require.NoError(t, err)
+	defer func() {
+		errC := l.Close()
+		require.NoError(t, errC)
+	}()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	m := mux.NewRouter()
+
+	var cnt atomic.Int32
+	once := sync.Once{}
+	err = m.Handle("/count", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		assert.Equal(t, codes.GET, r.Code())
+		cnt.Add(1)
+		errH := w.SetResponse(codes.Content, message.AppOctets, bytes.NewReader([]byte{byte(cnt.Load())}))
+		require.NoError(t, errH)
+
+		// Only one delay to trigger retransmissions
+		once.Do(func() {
+			<-time.After(300 * time.Millisecond)
+		})
+	}))
+	require.NoError(t, err)
+
+	s := udp.NewServer(options.WithMux(m),
+		options.WithErrors(func(err error) {
+			require.NoError(t, err)
+		}),
+	)
+	defer s.Stop()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errS := s.Serve(l)
+		assert.NoError(t, errS)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+	defer cancel()
+
+	// Use WithTransmissionRFC7252 to enable exponential backoff.
+	// acknowledgeRandomFactor=1.0 disables randomization for deterministic tests.
+	cc, err := udp.Dial(l.LocalAddr().String(),
+		options.WithErrors(func(err error) {
+			require.NoError(t, err)
+		}),
+		options.WithTransmission(1, 100*time.Millisecond, 50),
+		options.WithTransmissionBackoff(1.0, true),
+		options.WithPeriodicRunner(periodic.New(ctx.Done(), time.Millisecond*10)),
+	)
+	require.NoError(t, err)
+	defer func() {
+		errC := cc.Close()
+		require.NoError(t, errC)
+	}()
+
+	// First request should trigger retransmissions due to 300ms server delay
+	// with 100ms initial timeout and exponential backoff.
+	got, err := cc.Get(ctx, "/count")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content.String(), got.Code().String())
+	ct, err := got.ContentFormat()
+	require.NoError(t, err)
+	require.Equal(t, message.AppOctets, ct)
+	require.Equal(t, []byte{1}, bodyToBytes(t, got.Body()))
+
+	// Second request should get "2"
+	got, err = cc.Get(ctx, "/count")
+	require.NoError(t, err)
+	require.Equal(t, codes.Content.String(), got.Code().String())
+	ct, err = got.ContentFormat()
+	require.NoError(t, err)
+	require.Equal(t, message.AppOctets, ct)
+	require.Equal(t, []byte{2}, bodyToBytes(t, got.Body()))
+
+	// Wait for periodic runner
+	time.Sleep(150 * time.Millisecond)
+
+	stats := cc.Stats()
+	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
+	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(2))
+	assert.Equal(t, uint64(1), stats.MessagesRetransmitted)
+	assert.GreaterOrEqual(t, stats.TotalRetransmits, uint64(1))
+	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
+}
+
+func TestBuildRetransmitSchedule(t *testing.T) {
+	// Test that the schedule produces exponential backoff with no random factor
+	tr := client.NewTransmission(1, time.Second, 4, 1.0, true)
+
+	schedule := tr.BuildRetransmitSchedule()
+	require.Len(t, schedule, 4)
+
+	// With randomFactor=1.0 and ackTimeout=1s, the schedule should be:
+	// [1s, 3s, 7s, 15s] (cumulative: 1, 1+2, 1+2+4, 1+2+4+8)
+	require.Equal(t, time.Second*1, schedule[0])
+	require.Equal(t, time.Second*3, schedule[1])
+	require.Equal(t, time.Second*7, schedule[2])
+	require.Equal(t, time.Second*15, schedule[3])
+}
+
+func TestBuildRetransmitScheduleDisabled(t *testing.T) {
+	// When exponential backoff is disabled, schedule should be nil (legacy linear)
+	tr := client.NewTransmission(1, time.Second, 4, 1.5, false)
+
+	schedule := tr.BuildRetransmitSchedule()
+	require.Nil(t, schedule)
+}
+
+func TestBuildRetransmitScheduleWithRandomFactor(t *testing.T) {
+	// With randomFactor > 1.0, schedule values should be between
+	// pure-exponential and pure-exponential * randomFactor
+	tr := client.NewTransmission(1, time.Second, 4, 1.5, true)
+
+	// Run multiple times to verify randomization is bounded
+	for range 20 {
+		schedule := tr.BuildRetransmitSchedule()
+		require.Len(t, schedule, 4)
+
+		// First retransmit should be in [1s, 1.5s]
+		require.GreaterOrEqual(t, schedule[0], time.Second)
+		require.LessOrEqual(t, schedule[0], time.Duration(float64(time.Second)*1.5))
+
+		// All entries should be monotonically increasing
+		for j := 1; j < len(schedule); j++ {
+			require.Greater(t, schedule[j], schedule[j-1])
+		}
+
+		// Total span should be between [15s, 22.5s] (15 * 1.0 to 15 * 1.5)
+		require.GreaterOrEqual(t, schedule[3], time.Second*15)
+		require.LessOrEqual(t, schedule[3], time.Duration(float64(time.Second*15)*1.5))
+	}
+}
+
+func TestBuildRetransmitScheduleOverflow(t *testing.T) {
+	// With 100ms timeout and maxRetransmit=50, timeout doubles past int64 max
+	// around iteration 37. Verify that saturation prevents negative durations.
+	tr := client.NewTransmission(1, 100*time.Millisecond, 50, 1.0, true)
+
+	schedule := tr.BuildRetransmitSchedule()
+	require.Len(t, schedule, 50)
+
+	for i, d := range schedule {
+		require.Positive(t, d, "schedule[%d] should be positive, got %v", i, d)
+	}
+	for i := 1; i < len(schedule); i++ {
+		require.GreaterOrEqual(t, schedule[i], schedule[i-1],
+			"schedule should be monotonically non-decreasing: schedule[%d]=%v < schedule[%d]=%v",
+			i, schedule[i], i-1, schedule[i-1])
+	}
+}
+
+func TestBuildRetransmitScheduleOverflowDefault(t *testing.T) {
+	// With default 2s ackTimeout, overflow occurs around iteration 33.
+	tr := client.NewTransmission(1, 2*time.Second, 40, 1.5, true)
+
+	schedule := tr.BuildRetransmitSchedule()
+	require.Len(t, schedule, 40)
+
+	for i, d := range schedule {
+		require.Positive(t, d, "schedule[%d] should be positive, got %v", i, d)
+	}
+	for i := 1; i < len(schedule); i++ {
+		require.GreaterOrEqual(t, schedule[i], schedule[i-1],
+			"schedule should be monotonically non-decreasing: schedule[%d]=%v < schedule[%d]=%v",
+			i, schedule[i], i-1, schedule[i-1])
+	}
+}
+
 func testParallelConnGet(t *testing.T, numParallel int) {
 	type args struct {
 		path string

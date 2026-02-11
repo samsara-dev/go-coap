@@ -218,6 +218,8 @@ func (s *Server) createConn(connection *coapNet.Conn, inactivityMonitor udpClien
 	cfg.TransmissionNStart = s.cfg.TransmissionNStart
 	cfg.TransmissionAcknowledgeTimeout = s.cfg.TransmissionAcknowledgeTimeout
 	cfg.TransmissionMaxRetransmit = s.cfg.TransmissionMaxRetransmit
+	cfg.TransmissionAcknowledgeRandomFactor = s.cfg.TransmissionAcknowledgeRandomFactor
+	cfg.TransmissionExponentialBackoffEnable = s.cfg.TransmissionExponentialBackoffEnable
 	cfg.Handler = s.cfg.Handler
 	cfg.BlockwiseSZX = s.cfg.BlockwiseSZX
 	cfg.Errors = s.cfg.Errors
