@@ -40,11 +40,13 @@ var DefaultConfig = func() Config {
 		RequestMonitor: func(*udpClient.Conn, *pool.Message) (bool, error) {
 			return false, nil
 		},
-		TransmissionNStart:             1,
-		TransmissionAcknowledgeTimeout: time.Second * 2,
-		TransmissionMaxRetransmit:      4,
-		GetMID:                         message.GetMID,
-		MTU:                            udpClient.DefaultMTU,
+		TransmissionNStart:                   1,
+		TransmissionAcknowledgeTimeout:       time.Second * 2,
+		TransmissionMaxRetransmit:            4,
+		TransmissionAcknowledgeRandomFactor:  1.5,
+		TransmissionExponentialBackoffEnable: false,
+		GetMID:                               message.GetMID,
+		MTU:                                  udpClient.DefaultMTU,
 	}
 	opts.Handler = func(w *responsewriter.ResponseWriter[*udpClient.Conn], _ *pool.Message) {
 		if err := w.SetResponse(codes.NotFound, message.TextPlain, nil); err != nil {
@@ -56,13 +58,15 @@ var DefaultConfig = func() Config {
 
 type Config struct {
 	config.Common[*udpClient.Conn]
-	CreateInactivityMonitor        udpClient.CreateInactivityMonitorFunc
-	GetMID                         GetMIDFunc
-	Handler                        HandlerFunc
-	OnNewConn                      OnNewConnFunc
-	RequestMonitor                 udpClient.RequestMonitorFunc
-	TransmissionNStart             uint32
-	TransmissionAcknowledgeTimeout time.Duration
-	TransmissionMaxRetransmit      uint32
-	MTU                            uint16
+	CreateInactivityMonitor              udpClient.CreateInactivityMonitorFunc
+	GetMID                               GetMIDFunc
+	Handler                              HandlerFunc
+	OnNewConn                            OnNewConnFunc
+	RequestMonitor                       udpClient.RequestMonitorFunc
+	TransmissionNStart                   uint32
+	TransmissionAcknowledgeTimeout       time.Duration
+	TransmissionMaxRetransmit            uint32
+	TransmissionAcknowledgeRandomFactor  float64
+	TransmissionExponentialBackoffEnable bool
+	MTU                                  uint16
 }

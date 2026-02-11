@@ -25,6 +25,8 @@ func TestUDPServerApply(t *testing.T) {
 	require.Equal(t, uint32(10), cfg.TransmissionNStart)
 	require.Equal(t, time.Second, cfg.TransmissionAcknowledgeTimeout)
 	require.Equal(t, uint32(5), cfg.TransmissionMaxRetransmit)
+	require.Equal(t, 1.5, cfg.TransmissionAcknowledgeRandomFactor)
+	require.False(t, cfg.TransmissionExponentialBackoffEnable)
 	// WithMTU
 	require.Equal(t, uint16(1500), cfg.MTU)
 }
@@ -42,6 +44,8 @@ func TestDTLSServerApply(t *testing.T) {
 	require.Equal(t, uint32(10), cfg.TransmissionNStart)
 	require.Equal(t, time.Second, cfg.TransmissionAcknowledgeTimeout)
 	require.Equal(t, uint32(5), cfg.TransmissionMaxRetransmit)
+	require.Equal(t, 1.5, cfg.TransmissionAcknowledgeRandomFactor)
+	require.False(t, cfg.TransmissionExponentialBackoffEnable)
 	// WithMTU
 	require.Equal(t, uint16(1500), cfg.MTU)
 }
@@ -59,6 +63,40 @@ func TestUDPClientApply(t *testing.T) {
 	require.Equal(t, uint32(10), cfg.TransmissionNStart)
 	require.Equal(t, time.Second, cfg.TransmissionAcknowledgeTimeout)
 	require.Equal(t, uint32(5), cfg.TransmissionMaxRetransmit)
+	require.Equal(t, 1.5, cfg.TransmissionAcknowledgeRandomFactor)
+	require.False(t, cfg.TransmissionExponentialBackoffEnable)
 	// WithMTU
 	require.Equal(t, uint16(1500), cfg.MTU)
+}
+
+func TestUDPServerApplyBackoff(t *testing.T) {
+	cfg := udpServer.Config{}
+	opt := []udpServer.Option{
+		options.WithTransmission(1, 2*time.Second, 4),
+		options.WithTransmissionBackoff(1.5, true),
+	}
+	for _, o := range opt {
+		o.UDPServerApply(&cfg)
+	}
+	require.Equal(t, uint32(1), cfg.TransmissionNStart)
+	require.Equal(t, 2*time.Second, cfg.TransmissionAcknowledgeTimeout)
+	require.Equal(t, uint32(4), cfg.TransmissionMaxRetransmit)
+	require.Equal(t, 1.5, cfg.TransmissionAcknowledgeRandomFactor)
+	require.True(t, cfg.TransmissionExponentialBackoffEnable)
+}
+
+func TestUDPClientApplyBackoff(t *testing.T) {
+	cfg := client.Config{}
+	opt := []udp.Option{
+		options.WithTransmission(1, 2*time.Second, 4),
+		options.WithTransmissionBackoff(1.5, true),
+	}
+	for _, o := range opt {
+		o.UDPClientApply(&cfg)
+	}
+	require.Equal(t, uint32(1), cfg.TransmissionNStart)
+	require.Equal(t, 2*time.Second, cfg.TransmissionAcknowledgeTimeout)
+	require.Equal(t, uint32(4), cfg.TransmissionMaxRetransmit)
+	require.Equal(t, 1.5, cfg.TransmissionAcknowledgeRandomFactor)
+	require.True(t, cfg.TransmissionExponentialBackoffEnable)
 }

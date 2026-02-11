@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net"
 	"strconv"
 	"sync"
@@ -80,6 +81,12 @@ type midElement struct {
 	deadline   time.Time
 	retransmit atomic.Uint32
 
+	// retransmitSchedule holds the cumulative deadline offsets from start for
+	// each retransmission. When exponential backoff is enabled, the schedule
+	// is precomputed at creation time so that the random factor is applied
+	// once and all subsequent checks are deterministic.
+	retransmitSchedule []time.Duration
+
 	private struct {
 		sync.Mutex
 		msg *pool.Message
@@ -105,7 +112,16 @@ func (m *midElement) IsExpired(now time.Time, maxRetransmit uint32) bool {
 }
 
 func (m *midElement) Retransmit(now time.Time, acknowledgeTimeout time.Duration) (shouldRetransmit bool, isFirstRetransmit bool) {
-	if now.After(m.start.Add(acknowledgeTimeout * time.Duration(m.retransmit.Load()+1))) {
+	retransmitCount := m.retransmit.Load()
+	var deadline time.Time
+	if len(m.retransmitSchedule) > 0 && int(retransmitCount) < len(m.retransmitSchedule) {
+		// Use precomputed schedule (exponential backoff with random factor).
+		deadline = m.start.Add(m.retransmitSchedule[retransmitCount])
+	} else {
+		// Legacy linear backoff: retransmit at acknowledgeTimeout * (count + 1).
+		deadline = m.start.Add(acknowledgeTimeout * time.Duration(retransmitCount+1))
+	}
+	if now.After(deadline) {
 		newValue := m.retransmit.Add(1)
 		isFirstRetransmit = (newValue == 1)
 		// retransmit
@@ -226,9 +242,11 @@ type Conn struct {
 
 // Transmission is a threadsafe container for transmission related parameters
 type Transmission struct {
-	nStart             *atomic.Uint32
-	acknowledgeTimeout *atomic.Duration
-	maxRetransmit      *atomic.Uint32
+	nStart                   *atomic.Uint32
+	acknowledgeTimeout       *atomic.Duration
+	maxRetransmit            *atomic.Uint32
+	acknowledgeRandomFactor  *atomic.Float64
+	exponentialBackoffEnable *atomic.Bool
 }
 
 // SetTransmissionNStart changing the nStart value will only effect requests queued after the change. The requests waiting here already before the change will get unblocked when enough weight has been released.
@@ -242,6 +260,78 @@ func (t *Transmission) SetTransmissionAcknowledgeTimeout(d time.Duration) {
 
 func (t *Transmission) SetTransmissionMaxRetransmit(d uint32) {
 	t.maxRetransmit.Store(d)
+}
+
+// SetTransmissionAcknowledgeRandomFactor sets the ACK_RANDOM_FACTOR per RFC 7252.
+// The initial timeout for a confirmable message is chosen randomly between
+// acknowledgeTimeout and acknowledgeTimeout * acknowledgeRandomFactor.
+// The default value per the RFC is 1.5. A value of 1.0 disables randomization.
+func (t *Transmission) SetTransmissionAcknowledgeRandomFactor(f float64) {
+	t.acknowledgeRandomFactor.Store(f)
+}
+
+// SetTransmissionExponentialBackoffEnable enables or disables exponential backoff
+// for retransmissions per RFC 7252 Section 4.2. When enabled, the retransmission
+// timeout doubles on each attempt. When disabled (the default), linear multiples
+// of acknowledgeTimeout are used for backwards compatibility.
+func (t *Transmission) SetTransmissionExponentialBackoffEnable(enable bool) {
+	t.exponentialBackoffEnable.Store(enable)
+}
+
+// NewTransmission creates a new Transmission with the given parameters.
+func NewTransmission(nStart uint32, acknowledgeTimeout time.Duration, maxRetransmit uint32, acknowledgeRandomFactor float64, exponentialBackoffEnable bool) *Transmission {
+	return &Transmission{
+		nStart:                   atomic.NewUint32(nStart),
+		acknowledgeTimeout:       atomic.NewDuration(acknowledgeTimeout),
+		maxRetransmit:            atomic.NewUint32(maxRetransmit),
+		acknowledgeRandomFactor:  atomic.NewFloat64(acknowledgeRandomFactor),
+		exponentialBackoffEnable: atomic.NewBool(exponentialBackoffEnable),
+	}
+}
+
+// BuildRetransmitSchedule precomputes the cumulative retransmission deadlines
+// (as offsets from start) according to RFC 7252 Section 4.2.
+//
+// Per the RFC, the initial timeout is chosen randomly in the range
+// [acknowledgeTimeout, acknowledgeTimeout * acknowledgeRandomFactor].
+// On each subsequent retransmission the timeout doubles. The schedule
+// contains maxRetransmit entries where schedule[i] is the cumulative
+// time from message start at which retransmission i should occur.
+// If randomFactor is less than 1.0, it will be clamped to 1.0, which
+// effectively disables exponential backoff.
+//
+// When exponentialBackoffEnable is false, nil is returned and the legacy
+// linear schedule is used instead.
+func (t *Transmission) BuildRetransmitSchedule() []time.Duration {
+	if !t.exponentialBackoffEnable.Load() {
+		return nil
+	}
+	maxRetransmit := t.maxRetransmit.Load()
+	ackTimeout := t.acknowledgeTimeout.Load()
+	randomFactor := t.acknowledgeRandomFactor.Load()
+
+	if randomFactor < 1.0 {
+		randomFactor = 1.0
+	}
+
+	// Pick the initial timeout randomly in [ackTimeout, ackTimeout * randomFactor].
+	initialTimeout := ackTimeout
+	if randomFactor > 1.0 {
+		minNs := float64(ackTimeout.Nanoseconds())
+		maxNs := float64(ackTimeout.Nanoseconds()) * randomFactor
+		//nolint:gosec // this is not security-sensitive; jitter only
+		initialTimeout = time.Duration(minNs + rand.Float64()*(maxNs-minNs))
+	}
+
+	schedule := make([]time.Duration, maxRetransmit)
+	cumulative := time.Duration(0)
+	timeout := initialTimeout
+	for i := range uint32(maxRetransmit) {
+		cumulative = min(cumulative, math.MaxInt64-timeout) + timeout
+		schedule[i] = cumulative
+		timeout = min(timeout, math.MaxInt64/2) * 2 // exponential backoff
+	}
+	return schedule
 }
 
 func (cc *Conn) Transmission() *Transmission {
@@ -368,9 +458,11 @@ func NewConnWithOpts(session Session, cfg *Config, opts ...Option) *Conn {
 	cc := Conn{
 		session: session,
 		transmission: &Transmission{
-			atomic.NewUint32(cfg.TransmissionNStart),
-			atomic.NewDuration(cfg.TransmissionAcknowledgeTimeout),
-			atomic.NewUint32(cfg.TransmissionMaxRetransmit),
+			nStart:                   atomic.NewUint32(cfg.TransmissionNStart),
+			acknowledgeTimeout:       atomic.NewDuration(cfg.TransmissionAcknowledgeTimeout),
+			maxRetransmit:            atomic.NewUint32(cfg.TransmissionMaxRetransmit),
+			acknowledgeRandomFactor:  atomic.NewFloat64(cfg.TransmissionAcknowledgeRandomFactor),
+			exponentialBackoffEnable: atomic.NewBool(cfg.TransmissionExponentialBackoffEnable),
 		},
 		blockwiseSZX: cfg.BlockwiseSZX,
 
@@ -550,9 +642,10 @@ func (cc *Conn) prepareWriteMessage(req *pool.Message, handler HandlerFunc) (fun
 		}
 		deadline, _ := req.Context().Deadline()
 		if _, loaded := cc.midHandlerContainer.LoadOrStore(req.MessageID(), &midElement{
-			handler:  handler,
-			start:    time.Now(),
-			deadline: deadline,
+			handler:            handler,
+			start:              time.Now(),
+			deadline:           deadline,
+			retransmitSchedule: cc.transmission.BuildRetransmitSchedule(),
 			private: struct {
 				sync.Mutex
 				msg *pool.Message
@@ -647,8 +740,9 @@ func (cc *Conn) AsyncPing(receivedPong func()) (func(), error) {
 				receivedPong()
 			}
 		},
-		start:    time.Now(),
-		deadline: time.Time{}, // no deadline
+		start:              time.Now(),
+		deadline:           time.Time{}, // no deadline
+		retransmitSchedule: cc.transmission.BuildRetransmitSchedule(),
 		private: struct {
 			sync.Mutex
 			msg *pool.Message
