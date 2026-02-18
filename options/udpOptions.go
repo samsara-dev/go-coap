@@ -10,35 +10,27 @@ import (
 
 // TransmissionOpt transmission options.
 type TransmissionOpt struct {
-	transmissionNStart                   uint32
-	transmissionAcknowledgeTimeout       time.Duration
-	transmissionMaxRetransmit            uint32
-	transmissionAcknowledgeRandomFactor  float64
-	transmissionExponentialBackoffEnable bool
+	transmissionNStart             uint32
+	transmissionAcknowledgeTimeout time.Duration
+	transmissionMaxRetransmit      uint32
 }
 
 func (o TransmissionOpt) UDPServerApply(cfg *udpServer.Config) {
 	cfg.TransmissionNStart = o.transmissionNStart
 	cfg.TransmissionAcknowledgeTimeout = o.transmissionAcknowledgeTimeout
 	cfg.TransmissionMaxRetransmit = o.transmissionMaxRetransmit
-	cfg.TransmissionAcknowledgeRandomFactor = o.transmissionAcknowledgeRandomFactor
-	cfg.TransmissionExponentialBackoffEnable = o.transmissionExponentialBackoffEnable
 }
 
 func (o TransmissionOpt) DTLSServerApply(cfg *dtlsServer.Config) {
 	cfg.TransmissionNStart = o.transmissionNStart
 	cfg.TransmissionAcknowledgeTimeout = o.transmissionAcknowledgeTimeout
 	cfg.TransmissionMaxRetransmit = o.transmissionMaxRetransmit
-	cfg.TransmissionAcknowledgeRandomFactor = o.transmissionAcknowledgeRandomFactor
-	cfg.TransmissionExponentialBackoffEnable = o.transmissionExponentialBackoffEnable
 }
 
 func (o TransmissionOpt) UDPClientApply(cfg *udpClient.Config) {
 	cfg.TransmissionNStart = o.transmissionNStart
 	cfg.TransmissionAcknowledgeTimeout = o.transmissionAcknowledgeTimeout
 	cfg.TransmissionMaxRetransmit = o.transmissionMaxRetransmit
-	cfg.TransmissionAcknowledgeRandomFactor = o.transmissionAcknowledgeRandomFactor
-	cfg.TransmissionExponentialBackoffEnable = o.transmissionExponentialBackoffEnable
 }
 
 // WithTransmission set options for (re)transmission for Confirmable message-s.
