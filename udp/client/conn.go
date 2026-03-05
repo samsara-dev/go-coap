@@ -532,10 +532,8 @@ func (cc *Conn) Close() error {
 
 func (cc *Conn) doInternal(req *pool.Message) (*pool.Message, error) {
 	token := req.Token()
-	if token == nil {
-		return nil, errors.New("invalid token")
-	}
-
+	// nil token is valid for minimal CoAP (TKL=0): request token becomes nil via SetToken([]byte{}),
+	// response has TKL=0 parsed as nil. Both hash to 0 for handler lookup.
 	respChan := make(chan *pool.Message, 1)
 	if _, loaded := cc.tokenHandlerContainer.LoadOrStore(token.Hash(), func(_ *responsewriter.ResponseWriter[*Conn], r *pool.Message) {
 		r.Hijack()

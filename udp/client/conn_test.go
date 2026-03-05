@@ -14,6 +14,7 @@ import (
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/mux"
+	"github.com/plgd-dev/go-coap/v3/net/blockwise"
 	coapNet "github.com/plgd-dev/go-coap/v3/net"
 	"github.com/plgd-dev/go-coap/v3/net/responsewriter"
 	"github.com/plgd-dev/go-coap/v3/options"
@@ -1262,4 +1263,63 @@ func TestConnRequestMonitorDropRequest(t *testing.T) {
 	assert.Equal(t, uint64(2), stats.MessagesTransmitted)
 	assert.GreaterOrEqual(t, stats.MessagesReceived, uint64(1))
 	assert.Equal(t, uint64(0), stats.MessagesExceededMaxRetransmit)
+}
+
+// TestConnZeroLengthToken verifies that a client using WithGetToken returning []byte{}
+// can successfully complete a request. Minimal CoAP (TKL=0) uses no token on the wire;
+// SetToken([]byte{}) stores nil due to append(nil, []byte{}...) returning nil.
+// doInternal must accept nil token (both nil and []byte{} hash to 0 for handler lookup).
+// Without the fix, this test fails with "invalid token".
+func TestConnZeroLengthToken(t *testing.T) {
+	l, err := coapNet.NewListenUDP("udp", "")
+	require.NoError(t, err)
+	defer func() {
+		errC := l.Close()
+		require.NoError(t, errC)
+	}()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	m := mux.NewRouter()
+	err = m.Handle("/test", mux.HandlerFunc(func(w mux.ResponseWriter, r *mux.Message) {
+		assert.Equal(t, codes.POST, r.Code())
+		errH := w.SetResponse(codes.Content, message.TextPlain, bytes.NewReader([]byte("ok")))
+		require.NoError(t, errH)
+	}))
+	require.NoError(t, err)
+
+	s := udp.NewServer(options.WithMux(m),
+		options.WithErrors(func(err error) {
+			require.NoError(t, err)
+		}))
+	defer s.Stop()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		errS := s.Serve(l)
+		assert.NoError(t, errS)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cc, err := udp.Dial(l.LocalAddr().String(),
+		options.WithErrors(func(err error) {
+			require.NoError(t, err)
+		}),
+		options.WithGetToken(func() (message.Token, error) {
+			return []byte{}, nil
+		}),
+		options.WithBlockwise(false, blockwise.SZX16, time.Second),
+	)
+	require.NoError(t, err)
+	defer func() {
+		errC := cc.Close()
+		require.NoError(t, errC)
+	}()
+
+	got, err := cc.Post(ctx, "/test", message.TextPlain, bytes.NewReader([]byte("hello")))
+	require.NoError(t, err)
+	require.Equal(t, codes.Content.String(), got.Code().String())
+	require.Equal(t, []byte("ok"), bodyToBytes(t, got.Body()))
 }
