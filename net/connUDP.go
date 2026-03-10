@@ -283,6 +283,22 @@ func NewUDPConn(network string, c *net.UDPConn, opts ...UDPOption) *UDPConn {
 	}
 }
 
+// NewUDPConnFromPacketConn creates a UDPConn from a custom net.PacketConn (e.g. encrypted or wrapped packet conn).
+// underlyingConn is the raw UDP conn used for NetConn() and IPv4 fallback; it must match pc's local addr.
+func NewUDPConnFromPacketConn(pc net.PacketConn, underlyingConn *net.UDPConn, network string, opts ...UDPOption) *UDPConn {
+	cfg := DefaultUDPConnConfig
+	for _, o := range opts {
+		o.ApplyUDP(&cfg)
+	}
+	adapter := newCustomTransportPacketConnAdapter(pc, underlyingConn.LocalAddr())
+	return &UDPConn{
+		network:    network,
+		connection: underlyingConn,
+		packetConn: adapter,
+		errors:     cfg.Errors,
+	}
+}
+
 // LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
 func (c *UDPConn) LocalAddr() net.Addr {
 	return c.connection.LocalAddr()
@@ -299,9 +315,24 @@ func (c *UDPConn) Network() string {
 }
 
 // Close closes the connection.
+// When using NewUDPConnFromPacketConn, also closes the custom net.PacketConn
+// so it can release its resources (goroutines, buffers, encryption state).
+// The custom packet conn may wrap the same underlying connection; closing it
+// first ensures proper cleanup. Both close errors (adapter and underlying conn)
+// are combined and returned via errors.Join.
 func (c *UDPConn) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	if adapter, ok := c.packetConn.(*customTransportPacketConnAdapter); ok {
+		err := adapter.Close()
+		errUnderlying := c.connection.Close()
+		// Don't surface net.ErrClosed from the second close—expected when the
+		// adapter already closed the same underlying connection.
+		if errUnderlying != nil && !errors.Is(errUnderlying, net.ErrClosed) {
+			err = errors.Join(err, errUnderlying)
+		}
+		return err
 	}
 	return c.connection.Close()
 }
@@ -333,6 +364,11 @@ func toControlMessage(p packetConn, iface *net.Interface, src *net.IP) *ControlM
 func (c *UDPConn) writeToAddr(iface *net.Interface, src *net.IP, multicastHopLimit int, raddr *net.UDPAddr, buffer []byte) error {
 	if c.closed.Load() {
 		return ErrConnectionIsClosed
+	}
+	// Custom packet conns (e.g. encrypted) must not use the raw c.connection for multicast.
+	// newPacketConnWithAddr would bypass the custom transport and send data through unprotected UDP.
+	if _, isCustom := c.packetConn.(*customTransportPacketConnAdapter); isCustom {
+		return errors.New("WriteMulticast not supported on custom packet conn")
 	}
 	p, err := newPacketConnWithAddr(raddr, c.connection)
 	if err != nil {
@@ -511,6 +547,11 @@ func (c *UDPConn) writeMulticast(ctx context.Context, raddr *net.UDPAddr, buffer
 }
 
 func (c *UDPConn) writeTo(raddr *net.UDPAddr, cm *ControlMessage, buffer []byte) (int, error) {
+	// Custom packet conns (e.g. encrypted) must always use the packet conn for writes;
+	// bypassing to c.connection.Write would send data through the raw unprotected transport.
+	if _, isCustom := c.packetConn.(*customTransportPacketConnAdapter); isCustom {
+		return c.packetConn.WriteTo(buffer, cm, raddr)
+	}
 	if !supportsOverrideRemoteAddr(c.connection) {
 		// If the remote address is set, we can use it as the destination address
 		// because the connection is already established.
