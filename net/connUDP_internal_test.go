@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"strconv"
@@ -566,4 +567,46 @@ func TestPacketConnReadFrom(t *testing.T) {
 			require.Equal(t, tt.wantN, gotN)
 		})
 	}
+}
+
+// closeTrackingPacketConn is a net.PacketConn that tracks whether Close was called.
+type closeTrackingPacketConn struct {
+	net.PacketConn
+	closeCalled bool
+}
+
+func (c *closeTrackingPacketConn) Close() error {
+	c.closeCalled = true
+	return c.PacketConn.Close()
+}
+
+func TestNewUDPConnFromPacketConn_CloseClosesCustomPacketConn(t *testing.T) {
+	conn, err := net.ListenUDP(udpNetwork, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	tracker := &closeTrackingPacketConn{PacketConn: conn}
+	udpConn := NewUDPConnFromPacketConn(tracker, conn, udpNetwork)
+	require.NoError(t, udpConn.Close())
+	assert.True(t, tracker.closeCalled, "custom packet conn Close must be called on UDPConn.Close")
+}
+
+// closeFailingPacketConn is a net.PacketConn that returns an error on Close.
+type closeFailingPacketConn struct {
+	net.PacketConn
+	closeErr error
+}
+
+func (c *closeFailingPacketConn) Close() error {
+	_ = c.PacketConn.Close()
+	return c.closeErr
+}
+
+func TestNewUDPConnFromPacketConn_ClosePropagatesAdapterError(t *testing.T) {
+	conn, err := net.ListenUDP(udpNetwork, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	wantErr := errors.New("custom transport cleanup failed")
+	failing := &closeFailingPacketConn{PacketConn: conn, closeErr: wantErr}
+	udpConn := NewUDPConnFromPacketConn(failing, conn, udpNetwork)
+	err = udpConn.Close()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, wantErr)
 }
